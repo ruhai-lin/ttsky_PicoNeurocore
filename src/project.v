@@ -18,7 +18,7 @@
  *   ui_in[1]    step          -- direct dendrite test: LIF dynamics
  *   ui_in[2]    clear         -- direct dendrite test: reset accumulators
  *   ui_in[4:3]  dendrite_sel  -- direct dendrite test: target (0-3)
- *   ui_in[5]    event_in      -- trigger axon -> synapse FSM flow
+ *   ui_in[5]    event_in      -- trigger axon -> synapse -> dendrite flow
  *   uio_in[7:0] syn_weight   -- 8-bit weight / data byte
  *   uo_out[3:0] spike_out    -- dendrite fire flags
  *   uo_out[4]   top_busy     -- 1 while FSM is processing
@@ -29,6 +29,11 @@
  *   ui_in[4]    byte_load    -- load uio_in byte into 32-bit accumulator
  *   ui_in[5]    word_write   -- write accumulated word to SRAM[addr]
  *   uio_in[7:0] data_byte   -- byte to accumulate
+ *
+ * Top-level FSM flow per event:
+ *   IDLE -> AXON_WAIT -> CLEAR
+ *     -> [SYN_READ -> SYN_WAIT -> SYN_NEXT] x N
+ *     -> STEP -> DONE -> IDLE
  */
 
 `default_nettype none
@@ -52,7 +57,7 @@ module tt_um_openram_top (
     // ==========================================================
     //  Pin decode
     // ==========================================================
-    wire       mode   = ui_in[7];
+    wire       mode    = ui_in[7];
     wire [7:0] data_in = uio_in;
 
     // Run-mode signals (gated by ~mode)
@@ -187,15 +192,137 @@ module tt_um_openram_top (
     );
 
     // ==========================================================
+    //  Top-level FSM
+    // ==========================================================
+    localparam [3:0]
+        TOP_IDLE      = 4'd0,
+        TOP_AXON_WAIT = 4'd1,
+        TOP_CLEAR     = 4'd2,
+        TOP_SYN_READ  = 4'd3,
+        TOP_SYN_WAIT  = 4'd4,
+        TOP_SYN_NEXT  = 4'd5,
+        TOP_STEP      = 4'd6,
+        TOP_DONE      = 4'd7;
+
+    reg [3:0]  top_state;
+    wire       top_busy = (top_state != TOP_IDLE);
+
+    reg [4:0]  syn_remaining;
+    reg [3:0]  syn_cur_addr;
+
+    // FSM-driven dendrite control signals
+    reg        fsm_syn_valid;
+    reg [1:0]  fsm_syn_target;
+    reg [7:0]  fsm_syn_weight;
+    reg        fsm_step;
+    reg        fsm_clear;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            top_state      <= TOP_IDLE;
+            syn_read_start <= 1'b0;
+            syn_read_addr  <= 4'd0;
+            fsm_range_ack  <= 1'b0;
+            syn_remaining  <= 5'd0;
+            syn_cur_addr   <= 4'd0;
+            fsm_syn_valid  <= 1'b0;
+            fsm_syn_target <= 2'd0;
+            fsm_syn_weight <= 8'd0;
+            fsm_step       <= 1'b0;
+            fsm_clear      <= 1'b0;
+        end else begin
+            syn_read_start <= 1'b0;
+            fsm_range_ack  <= 1'b0;
+            fsm_syn_valid  <= 1'b0;
+            fsm_step       <= 1'b0;
+            fsm_clear      <= 1'b0;
+
+            case (top_state)
+            TOP_IDLE: begin
+                if (event_in)
+                    top_state <= TOP_AXON_WAIT;
+            end
+
+            TOP_AXON_WAIT: begin
+                if (axon_range_valid) begin
+                    fsm_range_ack <= 1'b1;
+                    syn_cur_addr  <= axon_syn_start;
+                    syn_remaining <= axon_syn_count;
+                    top_state     <= TOP_CLEAR;
+                end
+            end
+
+            TOP_CLEAR: begin
+                fsm_clear <= 1'b1;
+                if (syn_remaining > 5'd0)
+                    top_state <= TOP_SYN_READ;
+                else
+                    top_state <= TOP_STEP;
+            end
+
+            TOP_SYN_READ: begin
+                syn_read_start <= 1'b1;
+                syn_read_addr  <= syn_cur_addr;
+                top_state      <= TOP_SYN_WAIT;
+            end
+
+            TOP_SYN_WAIT: begin
+                if (syn_read_done) begin
+                    if (syn_entry_valid) begin
+                        fsm_syn_valid  <= 1'b1;
+                        fsm_syn_target <= syn_entry_dendrite;
+                        fsm_syn_weight <= syn_entry_weight;
+                    end
+                    syn_remaining <= syn_remaining - 5'd1;
+                    syn_cur_addr  <= syn_cur_addr + 4'd1;
+                    top_state     <= TOP_SYN_NEXT;
+                end
+            end
+
+            TOP_SYN_NEXT: begin
+                if (syn_remaining > 5'd0)
+                    top_state <= TOP_SYN_READ;
+                else
+                    top_state <= TOP_STEP;
+            end
+
+            TOP_STEP: begin
+                fsm_step  <= 1'b1;
+                top_state <= TOP_DONE;
+            end
+
+            TOP_DONE: begin
+                top_state <= TOP_IDLE;
+            end
+
+            default: top_state <= TOP_IDLE;
+            endcase
+        end
+    end
+
+    // ==========================================================
     //  Dendrite array -- 4 independent LIF neurons
+    //
+    //  Inputs are OR'd: direct test interface | FSM-driven signals.
+    //  When the FSM is idle all fsm_* signals are 0, so the direct
+    //  test interface works transparently.
     // ==========================================================
     wire [3:0] spike_out;
     wire [15:0] membrane [0:3];
+
     wire [3:0] dend_syn_valid;
-    assign dend_syn_valid[0] = inject_valid & (dendrite_sel == 2'd0);
-    assign dend_syn_valid[1] = inject_valid & (dendrite_sel == 2'd1);
-    assign dend_syn_valid[2] = inject_valid & (dendrite_sel == 2'd2);
-    assign dend_syn_valid[3] = inject_valid & (dendrite_sel == 2'd3);
+    assign dend_syn_valid[0] = (inject_valid & (dendrite_sel == 2'd0))
+                             | (fsm_syn_valid & (fsm_syn_target == 2'd0));
+    assign dend_syn_valid[1] = (inject_valid & (dendrite_sel == 2'd1))
+                             | (fsm_syn_valid & (fsm_syn_target == 2'd1));
+    assign dend_syn_valid[2] = (inject_valid & (dendrite_sel == 2'd2))
+                             | (fsm_syn_valid & (fsm_syn_target == 2'd2));
+    assign dend_syn_valid[3] = (inject_valid & (dendrite_sel == 2'd3))
+                             | (fsm_syn_valid & (fsm_syn_target == 2'd3));
+
+    wire [7:0] dend_weight = fsm_syn_valid ? fsm_syn_weight : data_in;
+    wire       dend_step   = step_pin  | fsm_step;
+    wire       dend_clear  = clear_pin | fsm_clear;
 
     genvar gi;
     generate
@@ -204,61 +331,14 @@ module tt_um_openram_top (
                 .clk        (clk),
                 .rst_n      (rst_n),
                 .syn_valid  (dend_syn_valid[gi]),
-                .syn_weight (data_in),
-                .step       (step_pin),
-                .clear      (clear_pin),
+                .syn_weight (dend_weight),
+                .step       (dend_step),
+                .clear      (dend_clear),
                 .spike_out  (spike_out[gi]),
                 .membrane   (membrane[gi])
             );
         end
     endgenerate
-
-    // ==========================================================
-    //  Top-level FSM -- mini version for phase 3
-    //  Handles: event -> axon lookup -> single synapse read
-    // ==========================================================
-    localparam [2:0]
-        TOP_IDLE      = 3'd0,
-        TOP_AXON_WAIT = 3'd1,
-        TOP_SYN_WAIT  = 3'd2,
-        TOP_DONE      = 3'd3;
-
-    reg [2:0] top_state;
-    wire top_busy = (top_state != TOP_IDLE);
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            top_state      <= TOP_IDLE;
-            syn_read_start <= 1'b0;
-            syn_read_addr  <= 4'd0;
-            fsm_range_ack  <= 1'b0;
-        end else begin
-            syn_read_start <= 1'b0;
-            fsm_range_ack  <= 1'b0;
-            case (top_state)
-            TOP_IDLE: begin
-                if (event_in)
-                    top_state <= TOP_AXON_WAIT;
-            end
-            TOP_AXON_WAIT: begin
-                if (axon_range_valid) begin
-                    fsm_range_ack  <= 1'b1;
-                    syn_read_addr  <= axon_syn_start;
-                    syn_read_start <= 1'b1;
-                    top_state      <= TOP_SYN_WAIT;
-                end
-            end
-            TOP_SYN_WAIT: begin
-                if (syn_read_done)
-                    top_state <= TOP_DONE;
-            end
-            TOP_DONE: begin
-                top_state <= TOP_IDLE;
-            end
-            default: top_state <= TOP_IDLE;
-            endcase
-        end
-    end
 
     // ==========================================================
     //  Output mapping
@@ -273,8 +353,7 @@ module tt_um_openram_top (
     assign uio_oe  = 8'd0;
 
     wire _unused = &{ena, ui_in[6],
-                     axon_syn_count, syn_write_done,
-                     syn_entry_learn_en, syn_entry_dendrite,
-                     syn_entry_weight, syn_entry_raw, 1'b0};
+                     syn_write_done,
+                     syn_entry_learn_en, syn_entry_raw, 1'b0};
 
 endmodule
