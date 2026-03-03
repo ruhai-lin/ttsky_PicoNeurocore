@@ -1,37 +1,68 @@
-# SPDX-FileCopyrightText: © 2024 Tiny Tapeout
+# SPDX-FileCopyrightText: (c) 2024 Tiny Tapeout
 # SPDX-License-Identifier: Apache-2.0
 
 """
-PicoNeurocore — cocotb test suite
+PicoNeurocore -- cocotb test suite
 
 Phase 1: Verify dendrite (LIF) behaviour via the direct test interface.
+Phase 2: Verify event -> axon -> top-level FSM flow.
+Phase 3: Verify SRAM programming and synapse entry read/parse.
 
-Pin mapping (phase 1):
-  ui_in[0]    inject_valid   — pulse to send weight to selected dendrite
-  ui_in[1]    step           — pulse to run LIF dynamics on all dendrites
-  ui_in[2]    clear          — pulse to reset accumulators for next round
-  ui_in[4:3]  dendrite_sel   — target dendrite (0–3)
-  uio_in[7:0] syn_weight     — signed 8-bit weight
-  uo_out[3:0] spike_out      — fire status of dendrites 0–3
+Run-mode pin map (ui_in[7]=0):
+  ui_in[0]    inject_valid  -- pulse to send weight to selected dendrite
+  ui_in[1]    step          -- pulse to run LIF dynamics on all dendrites
+  ui_in[2]    clear         -- pulse to reset accumulators for next round
+  ui_in[4:3]  dendrite_sel  -- target dendrite (0-3)
+  ui_in[5]    event_in      -- pulse to trigger axon -> synapse FSM flow
+  uio_in[7:0] syn_weight   -- signed 8-bit weight
+  uo_out[3:0] spike_out    -- fire status of dendrites 0-3
+  uo_out[4]   top_busy     -- 1 while FSM is processing
+  uo_out[6]   syn_entry_valid -- last-read synapse valid bit
+
+Program-mode pin map (ui_in[7]=1):
+  ui_in[3:0]  addr         -- SRAM word address (0-15)
+  ui_in[4]    byte_load    -- load uio_in byte into 32-bit accumulator
+  ui_in[5]    word_write   -- write accumulated word to SRAM[addr]
+  uio_in[7:0] data_byte   -- byte to accumulate
 """
 
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles
 
-# ── ui_in bit-field helpers ──────────────────────────────────────────
-INJECT = 1 << 0
-STEP   = 1 << 1
-CLEAR  = 1 << 2
+# -- ui_in bit-field constants ------------------------------------------------
+INJECT   = 1 << 0
+STEP     = 1 << 1
+CLEAR    = 1 << 2
+EVENT_IN = 1 << 5
+MODE_BIT = 1 << 7
 
 def dend_sel(d):
     return (d & 0x3) << 3
 
 def weight_u8(val):
-    """Signed int → unsigned 8-bit (two's complement)."""
+    """Signed int -> unsigned 8-bit (two's complement)."""
     return val & 0xFF
 
-# ── Reusable primitives ─────────────────────────────────────────────
+# -- Output pin helpers (X-safe: treat unknown bits as 0) ---------------------
+
+def _uo_bit(dut, bit_pos):
+    """Read a single bit from uo_out, treating X/Z as 0."""
+    binstr = dut.uo_out.value.binstr
+    idx = len(binstr) - 1 - bit_pos
+    return 1 if binstr[idx] == '1' else 0
+
+def get_spikes(dut):
+    return (_uo_bit(dut, 3) << 3 | _uo_bit(dut, 2) << 2
+            | _uo_bit(dut, 1) << 1 | _uo_bit(dut, 0))
+
+def get_top_busy(dut):
+    return _uo_bit(dut, 4)
+
+def get_syn_entry_valid(dut):
+    return _uo_bit(dut, 6)
+
+# -- Reusable primitives ------------------------------------------------------
 
 async def reset(dut):
     dut.rst_n.value = 0
@@ -62,10 +93,62 @@ async def pulse_clear(dut):
     dut.ui_in.value = 0
     await ClockCycles(dut.clk, 1)
 
-def get_spikes(dut):
-    return dut.uo_out.value.integer & 0x0F
+async def trigger_event(dut):
+    """Pulse event_in to start the top-level FSM."""
+    dut.ui_in.value = EVENT_IN
+    await ClockCycles(dut.clk, 1)
+    dut.ui_in.value = 0
 
-# ── Tests ────────────────────────────────────────────────────────────
+async def wait_fsm_idle(dut, max_cycles=30):
+    """Wait for the top FSM to return to IDLE (top_busy=0)."""
+    for _ in range(max_cycles):
+        await ClockCycles(dut.clk, 1)
+        if get_top_busy(dut) == 0:
+            return
+    assert False, "FSM did not return to IDLE within max cycles"
+
+async def sram_program_word(dut, addr, word):
+    """Program a 32-bit word into SRAM at the given address (0-15).
+
+    Uses program mode: load 4 bytes (LSB first) then trigger word_write.
+    """
+    for i in range(4):
+        byte_val = (word >> (i * 8)) & 0xFF
+        dut.uio_in.value = byte_val
+        dut.ui_in.value = MODE_BIT | (1 << 4)       # mode=1, byte_load=1
+        await ClockCycles(dut.clk, 1)
+        dut.ui_in.value = MODE_BIT                   # deassert byte_load
+        await ClockCycles(dut.clk, 1)
+
+    # Write accumulated word to SRAM
+    dut.ui_in.value = MODE_BIT | (1 << 5) | (addr & 0xF)  # word_write + addr
+    await ClockCycles(dut.clk, 1)
+    dut.ui_in.value = MODE_BIT                       # deassert word_write
+    await ClockCycles(dut.clk, 2)                    # let SRAM latch
+
+    # Return to run mode
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    await ClockCycles(dut.clk, 1)
+
+def build_synapse_word(valid, learn_en, dendrite_id, weight):
+    """Build a 32-bit synapse entry word.
+
+    Format: [31] valid | [30] learn_en | [29:28] dendrite_id
+            | [27:24] reserved | [23:16] weight | [15:0] reserved
+    """
+    w = 0
+    if valid:
+        w |= (1 << 31)
+    if learn_en:
+        w |= (1 << 30)
+    w |= (dendrite_id & 0x3) << 28
+    w |= (weight & 0xFF) << 16
+    return w
+
+# ==============================================================================
+#  Phase 1: Dendrite tests
+# ==============================================================================
 
 @cocotb.test()
 async def test_dendrite_fire(dut):
@@ -74,7 +157,7 @@ async def test_dendrite_fire(dut):
     cocotb.start_soon(clock.start())
     await reset(dut)
 
-    # weight=120 → potential = 0 − 1(leak) + 120 = 119 ≥ 100(thresh) → fire
+    # weight=120 -> potential = 0 - 1(leak) + 120 = 119 >= 100(thresh) -> fire
     await inject_weight(dut, 0, 120)
     await pulse_step(dut)
 
@@ -82,7 +165,6 @@ async def test_dendrite_fire(dut):
     assert spikes & 1, f"Dendrite 0 should fire, got spikes={spikes:#06b}"
     assert not (spikes & 0xE), f"Only dendrite 0 should fire, got spikes={spikes:#06b}"
 
-    # After clear, spike flag must drop
     await pulse_clear(dut)
     assert get_spikes(dut) == 0, "Spikes should be cleared after clear pulse"
 
@@ -94,7 +176,7 @@ async def test_dendrite_no_fire(dut):
     cocotb.start_soon(clock.start())
     await reset(dut)
 
-    # weight=30 → potential = 0 − 1 + 30 = 29 < 100 → no fire
+    # weight=30 -> potential = 0 - 1 + 30 = 29 < 100 -> no fire
     await inject_weight(dut, 1, 30)
     await pulse_step(dut)
 
@@ -108,16 +190,16 @@ async def test_dendrite_accumulation(dut):
     cocotb.start_soon(clock.start())
     await reset(dut)
 
-    # Round 1: inject 60 → potential = 0 − 1 + 60 = 59, no fire
+    # Round 1: inject 60 -> potential = 0 - 1 + 60 = 59, no fire
     await inject_weight(dut, 0, 60)
     await pulse_step(dut)
-    assert get_spikes(dut) == 0, "Round 1: should not fire (potential≈59)"
+    assert get_spikes(dut) == 0, "Round 1: should not fire (potential~59)"
     await pulse_clear(dut)
 
-    # Round 2: inject 50 → potential = 59 − 1 + 50 = 108 ≥ 100 → fire
+    # Round 2: inject 50 -> potential = 59 - 1 + 50 = 108 >= 100 -> fire
     await inject_weight(dut, 0, 50)
     await pulse_step(dut)
-    assert get_spikes(dut) & 1, "Round 2: dendrite 0 should fire (potential≈108)"
+    assert get_spikes(dut) & 1, "Round 2: dendrite 0 should fire (potential~108)"
 
 
 @cocotb.test()
@@ -145,25 +227,24 @@ async def test_dendrite_leak(dut):
     cocotb.start_soon(clock.start())
     await reset(dut)
 
-    # Round 1: inject 99 → potential = 0 − 1 + 99 = 98
+    # Round 1: inject 99 -> potential = 0 - 1 + 99 = 98
     await inject_weight(dut, 0, 99)
     await pulse_step(dut)
     assert get_spikes(dut) == 0, "Round 1: no fire (potential=98)"
     await pulse_clear(dut)
 
-    # Round 2: no inject → potential = 98 − 1 = 97
+    # Round 2: no inject -> potential = 98 - 1 = 97
     await pulse_step(dut)
     assert get_spikes(dut) == 0, "Round 2: no fire (potential=97)"
     await pulse_clear(dut)
 
-    # Round 3: inject 2 → potential = 97 − 1 + 2 = 98, no fire
-    # (without leak it would be 99 + 2 = 101 → fire, so this proves leak works)
+    # Round 3: inject 2 -> potential = 97 - 1 + 2 = 98, no fire
     await inject_weight(dut, 0, 2)
     await pulse_step(dut)
     assert get_spikes(dut) == 0, "Round 3: no fire (potential=98, leak confirmed)"
     await pulse_clear(dut)
 
-    # Round 4: inject 3 → potential = 98 − 1 + 3 = 100 ≥ 100 → fire
+    # Round 4: inject 3 -> potential = 98 - 1 + 3 = 100 >= 100 -> fire
     await inject_weight(dut, 0, 3)
     await pulse_step(dut)
     assert get_spikes(dut) & 1, "Round 4: dendrite 0 should fire (potential=100)"
@@ -176,96 +257,119 @@ async def test_dendrite_inhibition(dut):
     cocotb.start_soon(clock.start())
     await reset(dut)
 
-    # Round 1: inject +80 → potential = 79
+    # Round 1: inject +80 -> potential = 79
     await inject_weight(dut, 0, 80)
     await pulse_step(dut)
     assert get_spikes(dut) == 0
     await pulse_clear(dut)
 
-    # Round 2: inject −30 → potential = 79 − 1 + (−30) = 48
+    # Round 2: inject -30 -> potential = 79 - 1 + (-30) = 48
     await inject_weight(dut, 0, -30)
     await pulse_step(dut)
     assert get_spikes(dut) == 0
     await pulse_clear(dut)
 
-    # Round 3: inject +60 → potential = 48 − 1 + 60 = 107 ≥ 100 → fire
+    # Round 3: inject +60 -> potential = 48 - 1 + 60 = 107 >= 100 -> fire
     await inject_weight(dut, 0, 60)
     await pulse_step(dut)
     assert get_spikes(dut) & 1, "Should fire: excitation overcomes prior inhibition"
 
 
-# ── Phase 2: Axon tests ─────────────────────────────────────────────
-
-EVENT_IN  = 1 << 5   # ui_in[5]
-RANGE_ACK = 1 << 6   # ui_in[6]
-
-def get_range_valid(dut):
-    return (dut.uo_out.value.integer >> 4) & 1
+# ==============================================================================
+#  Phase 2: Event -> Axon -> FSM flow tests
+# ==============================================================================
 
 @cocotb.test()
-async def test_axon_range(dut):
-    """Axon produces a valid synapse range and holds it until acknowledged."""
+async def test_event_fsm_basic(dut):
+    """Event triggers FSM: top_busy goes high then returns to idle."""
     clock = Clock(dut.clk, 20, units="ns")
     cocotb.start_soon(clock.start())
     await reset(dut)
 
-    # Pulse event_in
-    dut.ui_in.value = EVENT_IN
-    await ClockCycles(dut.clk, 1)
-    dut.ui_in.value = 0
-    await ClockCycles(dut.clk, 1)
+    assert get_top_busy(dut) == 0, "FSM should start idle"
 
-    # range_valid should be HIGH and stay HIGH (valid/ack handshake)
-    assert get_range_valid(dut) == 1, "range_valid should be high after event"
-
-    # It should persist for another cycle
+    await trigger_event(dut)
     await ClockCycles(dut.clk, 1)
-    assert get_range_valid(dut) == 1, "range_valid should persist until ack"
+    assert get_top_busy(dut) == 1, "FSM should be busy after event"
 
-    # Acknowledge the range
-    dut.ui_in.value = RANGE_ACK
-    await ClockCycles(dut.clk, 1)
-    dut.ui_in.value = 0
-    await ClockCycles(dut.clk, 1)
-
-    assert get_range_valid(dut) == 0, "range_valid should drop after ack"
+    await wait_fsm_idle(dut)
+    assert get_top_busy(dut) == 0, "FSM should return to idle"
 
 
 @cocotb.test()
-async def test_axon_no_event(dut):
-    """Without event_in, axon stays idle."""
+async def test_no_event_stays_idle(dut):
+    """Without event_in, FSM stays idle."""
     clock = Clock(dut.clk, 20, units="ns")
     cocotb.start_soon(clock.start())
     await reset(dut)
 
-    await ClockCycles(dut.clk, 5)
-    assert get_range_valid(dut) == 0, "range_valid should stay low without event"
+    await ClockCycles(dut.clk, 10)
+    assert get_top_busy(dut) == 0, "FSM should stay idle without event"
 
+
+# ==============================================================================
+#  Phase 3: SRAM programming + synapse read tests
+# ==============================================================================
 
 @cocotb.test()
-async def test_axon_ignores_event_while_busy(dut):
-    """A second event is ignored while a range is still outstanding."""
+async def test_sram_program_and_synapse_read(dut):
+    """Program a valid synapse entry at addr 0, trigger event, verify parsed fields."""
     clock = Clock(dut.clk, 20, units="ns")
     cocotb.start_soon(clock.start())
     await reset(dut)
 
-    # First event
-    dut.ui_in.value = EVENT_IN
-    await ClockCycles(dut.clk, 1)
-    dut.ui_in.value = 0
-    await ClockCycles(dut.clk, 1)
-    assert get_range_valid(dut) == 1
+    # valid=1, learn=1, dendrite=2, weight=42
+    entry = build_synapse_word(valid=1, learn_en=1, dendrite_id=2, weight=42)
+    await sram_program_word(dut, addr=0, word=entry)
 
-    # Second event while range is outstanding (should be ignored)
-    dut.ui_in.value = EVENT_IN
-    await ClockCycles(dut.clk, 1)
-    dut.ui_in.value = 0
-    await ClockCycles(dut.clk, 1)
-    assert get_range_valid(dut) == 1, "range_valid still high, second event ignored"
+    # Trigger event -> axon produces range -> FSM reads synapse at addr 0
+    await trigger_event(dut)
+    await wait_fsm_idle(dut)
 
-    # Ack clears the range
-    dut.ui_in.value = RANGE_ACK
-    await ClockCycles(dut.clk, 1)
-    dut.ui_in.value = 0
-    await ClockCycles(dut.clk, 1)
-    assert get_range_valid(dut) == 0, "range_valid cleared after ack"
+    # External pin: syn_entry_valid should be 1
+    assert get_syn_entry_valid(dut) == 1, \
+        "syn_entry_valid (uo_out[6]) should be 1 for valid entry"
+
+    # Hierarchical access to check parsed fields
+    syn = dut.user_project.u_synapse
+    assert syn.entry_valid.value == 1
+    assert syn.entry_learn_en.value == 1
+    assert syn.entry_dendrite.value == 2
+    assert syn.entry_weight.value == 42
+
+
+@cocotb.test()
+async def test_synapse_read_invalid_entry(dut):
+    """Program an invalid synapse entry (valid=0), verify syn_entry_valid=0."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    entry = build_synapse_word(valid=0, learn_en=0, dendrite_id=1, weight=10)
+    await sram_program_word(dut, addr=0, word=entry)
+
+    await trigger_event(dut)
+    await wait_fsm_idle(dut)
+
+    assert get_syn_entry_valid(dut) == 0, \
+        "syn_entry_valid should be 0 for invalid entry"
+
+
+@cocotb.test()
+async def test_synapse_read_negative_weight(dut):
+    """Verify correct parsing of negative (inhibitory) weight."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    # weight = -10 -> 0xF6 unsigned
+    entry = build_synapse_word(valid=1, learn_en=0, dendrite_id=0, weight=-10)
+    await sram_program_word(dut, addr=0, word=entry)
+
+    await trigger_event(dut)
+    await wait_fsm_idle(dut)
+
+    assert get_syn_entry_valid(dut) == 1
+    raw_w = dut.user_project.u_synapse.entry_weight.value.integer
+    assert raw_w == 0xF6, \
+        f"entry_weight should be 0xF6 (-10 signed), got {raw_w:#04x}"
