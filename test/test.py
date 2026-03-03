@@ -100,7 +100,7 @@ async def trigger_event(dut):
     await ClockCycles(dut.clk, 1)
     dut.ui_in.value = 0
 
-async def wait_fsm_idle(dut, max_cycles=200):
+async def wait_fsm_idle(dut, max_cycles=500):
     """Wait for the top FSM to return to IDLE (top_busy=0)."""
     for _ in range(max_cycles):
         await ClockCycles(dut.clk, 1)
@@ -530,3 +530,132 @@ async def test_full_event_potential_persists(dut):
     await trigger_event(dut)
     await wait_fsm_idle(dut)
     assert get_spikes(dut) & 0x1, "Event 2: dendrite 0 should fire (potential~118)"
+
+
+# ==============================================================================
+#  Phase 5: Learning -- weight update and SRAM write-back
+# ==============================================================================
+
+def sram_weight_at(dut, addr):
+    """Read the weight field [23:16] from SRAM internal memory at addr."""
+    word = dut.user_project.SRAM.mem[addr].value.integer
+    return (word >> 16) & 0xFF
+
+
+@cocotb.test()
+async def test_learning_potentiation(dut):
+    """Active synapse + dendrite fires + learn_en -> weight increases by 1."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    # weight=120 -> potential = 0 - 1 + 120 = 119 >= 100 -> fires
+    await program_synapse_table(dut, [
+        dict(valid=1, learn_en=1, dendrite_id=0, weight=120),
+    ])
+
+    await trigger_event(dut)
+    await wait_fsm_idle(dut)
+
+    assert get_spikes(dut) & 0x1, "Dendrite 0 should fire"
+    w = sram_weight_at(dut, 0)
+    assert w == 121, f"Weight should be 121 (120+1), got {w}"
+
+
+@cocotb.test()
+async def test_learning_depression(dut):
+    """Active synapse + dendrite does NOT fire + learn_en -> weight decreases by 1."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    # weight=30 -> potential = 0 - 1 + 30 = 29 < 100 -> no fire
+    await program_synapse_table(dut, [
+        dict(valid=1, learn_en=1, dendrite_id=0, weight=30),
+    ])
+
+    await trigger_event(dut)
+    await wait_fsm_idle(dut)
+
+    assert get_spikes(dut) == 0, "Dendrite 0 should NOT fire"
+    w = sram_weight_at(dut, 0)
+    assert w == 29, f"Weight should be 29 (30-1), got {w}"
+
+
+@cocotb.test()
+async def test_learning_disabled(dut):
+    """learn_en=0 -> weight unchanged even if dendrite fires."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    await program_synapse_table(dut, [
+        dict(valid=1, learn_en=0, dendrite_id=0, weight=120),
+    ])
+
+    await trigger_event(dut)
+    await wait_fsm_idle(dut)
+
+    assert get_spikes(dut) & 0x1, "Dendrite 0 should fire"
+    w = sram_weight_at(dut, 0)
+    assert w == 120, f"Weight should remain 120 (learn disabled), got {w}"
+
+
+@cocotb.test()
+async def test_learning_clamp_max(dut):
+    """Weight at +127, dendrite fires, potentiation -> stays at 127."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    # weight=127 -> potential = 0 - 1 + 127 = 126 >= 100 -> fires
+    await program_synapse_table(dut, [
+        dict(valid=1, learn_en=1, dendrite_id=0, weight=127),
+    ])
+
+    await trigger_event(dut)
+    await wait_fsm_idle(dut)
+
+    assert get_spikes(dut) & 0x1, "Dendrite 0 should fire"
+    w = sram_weight_at(dut, 0)
+    assert w == 127, f"Weight should stay at 127 (clamped), got {w}"
+
+
+@cocotb.test()
+async def test_learning_clamp_min(dut):
+    """Weight at -128 (0x80), dendrite no fire, depression -> stays at -128."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    # weight=-128 -> potential = max(0, 0-1+(-128)) = 0 -> no fire
+    await program_synapse_table(dut, [
+        dict(valid=1, learn_en=1, dendrite_id=0, weight=-128),
+    ])
+
+    await trigger_event(dut)
+    await wait_fsm_idle(dut)
+
+    assert get_spikes(dut) == 0, "Dendrite 0 should NOT fire"
+    w = sram_weight_at(dut, 0)
+    assert w == 0x80, f"Weight should stay at 0x80 (-128 clamped), got {w:#04x}"
+
+
+@cocotb.test()
+async def test_learning_multi_event_drift(dut):
+    """Repeated events gradually increase weight via potentiation."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    # weight=110 -> fires each event -> potentiation each time
+    await program_synapse_table(dut, [
+        dict(valid=1, learn_en=1, dendrite_id=0, weight=110),
+    ])
+
+    for i in range(3):
+        await trigger_event(dut)
+        await wait_fsm_idle(dut)
+
+    w = sram_weight_at(dut, 0)
+    assert w == 113, f"After 3 events weight should be 113 (110+3), got {w}"

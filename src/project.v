@@ -18,7 +18,7 @@
  *   ui_in[1]    step          -- direct dendrite test: LIF dynamics
  *   ui_in[2]    clear         -- direct dendrite test: reset accumulators
  *   ui_in[4:3]  dendrite_sel  -- direct dendrite test: target (0-3)
- *   ui_in[5]    event_in      -- trigger axon -> synapse -> dendrite flow
+ *   ui_in[5]    event_in      -- trigger full neurocore processing cycle
  *   uio_in[7:0] syn_weight   -- 8-bit weight / data byte
  *   uo_out[3:0] spike_out    -- dendrite fire flags
  *   uo_out[4]   top_busy     -- 1 while FSM is processing
@@ -32,8 +32,10 @@
  *
  * Top-level FSM flow per event:
  *   IDLE -> AXON_WAIT -> CLEAR
- *     -> [SYN_READ -> SYN_WAIT -> SYN_NEXT] x N
- *     -> STEP -> DONE -> IDLE
+ *     -> [SYN_READ -> SYN_WAIT -> SYN_NEXT] x N       (synapse scan)
+ *     -> STEP
+ *     -> [LEARN_READ -> LEARN_WAIT -> LEARN_WRITE? -> LEARN_NEXT] x N
+ *     -> DONE -> IDLE
  */
 
 `default_nettype none
@@ -144,14 +146,19 @@ module tt_um_openram_top (
     wire        syn_sram_csb;
     wire        syn_sram_web;
 
+    // Learning write-back interface
+    reg         learn_write_start;
+    reg  [3:0]  learn_write_addr;
+    reg  [31:0] learn_write_data;
+
     synapse u_synapse (
         .clk          (clk),
         .rst_n        (rst_n),
         .read_start   (syn_read_start),
         .read_addr    (syn_read_addr),
-        .write_start  (1'b0),
-        .write_addr   (4'd0),
-        .write_data   (32'd0),
+        .write_start  (learn_write_start),
+        .write_addr   (learn_write_addr),
+        .write_data   (learn_write_data),
         .read_done    (syn_read_done),
         .write_done   (syn_write_done),
         .entry_valid  (syn_entry_valid),
@@ -192,23 +199,49 @@ module tt_um_openram_top (
     );
 
     // ==========================================================
+    //  Learning module (combinational)
+    // ==========================================================
+    wire        learn_post_spike = spike_out[syn_entry_dendrite];
+    wire [7:0]  learn_new_weight;
+    wire        learn_weight_changed;
+
+    wire [31:0] learn_updated_word = {syn_entry_raw[31:24],
+                                      learn_new_weight,
+                                      syn_entry_raw[15:0]};
+
+    learning u_learning (
+        .learn_en       (syn_entry_learn_en),
+        .syn_active     (syn_entry_valid),
+        .post_spike     (learn_post_spike),
+        .current_weight (syn_entry_weight),
+        .new_weight     (learn_new_weight),
+        .weight_changed (learn_weight_changed)
+    );
+
+    // ==========================================================
     //  Top-level FSM
     // ==========================================================
     localparam [3:0]
-        TOP_IDLE      = 4'd0,
-        TOP_AXON_WAIT = 4'd1,
-        TOP_CLEAR     = 4'd2,
-        TOP_SYN_READ  = 4'd3,
-        TOP_SYN_WAIT  = 4'd4,
-        TOP_SYN_NEXT  = 4'd5,
-        TOP_STEP      = 4'd6,
-        TOP_DONE      = 4'd7;
+        TOP_IDLE        = 4'd0,
+        TOP_AXON_WAIT   = 4'd1,
+        TOP_CLEAR       = 4'd2,
+        TOP_SYN_READ    = 4'd3,
+        TOP_SYN_WAIT    = 4'd4,
+        TOP_SYN_NEXT    = 4'd5,
+        TOP_STEP        = 4'd6,
+        TOP_LEARN_READ  = 4'd7,
+        TOP_LEARN_WAIT  = 4'd8,
+        TOP_LEARN_WRITE = 4'd9,
+        TOP_LEARN_NEXT  = 4'd10,
+        TOP_DONE        = 4'd11;
 
     reg [3:0]  top_state;
     wire       top_busy = (top_state != TOP_IDLE);
 
     reg [4:0]  syn_remaining;
     reg [3:0]  syn_cur_addr;
+    reg [3:0]  range_start;
+    reg [4:0]  range_count;
 
     // FSM-driven dendrite control signals
     reg        fsm_syn_valid;
@@ -219,23 +252,30 @@ module tt_um_openram_top (
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            top_state      <= TOP_IDLE;
-            syn_read_start <= 1'b0;
-            syn_read_addr  <= 4'd0;
-            fsm_range_ack  <= 1'b0;
-            syn_remaining  <= 5'd0;
-            syn_cur_addr   <= 4'd0;
-            fsm_syn_valid  <= 1'b0;
-            fsm_syn_target <= 2'd0;
-            fsm_syn_weight <= 8'd0;
-            fsm_step       <= 1'b0;
-            fsm_clear      <= 1'b0;
+            top_state         <= TOP_IDLE;
+            syn_read_start    <= 1'b0;
+            syn_read_addr     <= 4'd0;
+            fsm_range_ack     <= 1'b0;
+            syn_remaining     <= 5'd0;
+            syn_cur_addr      <= 4'd0;
+            range_start       <= 4'd0;
+            range_count       <= 5'd0;
+            fsm_syn_valid     <= 1'b0;
+            fsm_syn_target    <= 2'd0;
+            fsm_syn_weight    <= 8'd0;
+            fsm_step          <= 1'b0;
+            fsm_clear         <= 1'b0;
+            learn_write_start <= 1'b0;
+            learn_write_addr  <= 4'd0;
+            learn_write_data  <= 32'd0;
         end else begin
-            syn_read_start <= 1'b0;
-            fsm_range_ack  <= 1'b0;
-            fsm_syn_valid  <= 1'b0;
-            fsm_step       <= 1'b0;
-            fsm_clear      <= 1'b0;
+            // Pulse defaults
+            syn_read_start    <= 1'b0;
+            fsm_range_ack     <= 1'b0;
+            fsm_syn_valid     <= 1'b0;
+            fsm_step          <= 1'b0;
+            fsm_clear         <= 1'b0;
+            learn_write_start <= 1'b0;
 
             case (top_state)
             TOP_IDLE: begin
@@ -248,6 +288,8 @@ module tt_um_openram_top (
                     fsm_range_ack <= 1'b1;
                     syn_cur_addr  <= axon_syn_start;
                     syn_remaining <= axon_syn_count;
+                    range_start   <= axon_syn_start;
+                    range_count   <= axon_syn_count;
                     top_state     <= TOP_CLEAR;
                 end
             end
@@ -260,6 +302,7 @@ module tt_um_openram_top (
                     top_state <= TOP_STEP;
             end
 
+            // ---- Synapse scan: read entries, send weights to dendrites ----
             TOP_SYN_READ: begin
                 syn_read_start <= 1'b1;
                 syn_read_addr  <= syn_cur_addr;
@@ -286,9 +329,50 @@ module tt_um_openram_top (
                     top_state <= TOP_STEP;
             end
 
+            // ---- Step: trigger LIF dynamics, then start learning scan ----
             TOP_STEP: begin
-                fsm_step  <= 1'b1;
-                top_state <= TOP_DONE;
+                fsm_step <= 1'b1;
+                if (range_count > 5'd0) begin
+                    syn_cur_addr  <= range_start;
+                    syn_remaining <= range_count;
+                    top_state     <= TOP_LEARN_READ;
+                end else begin
+                    top_state <= TOP_DONE;
+                end
+            end
+
+            // ---- Learning scan: re-read entries, update weights ----
+            TOP_LEARN_READ: begin
+                syn_read_start <= 1'b1;
+                syn_read_addr  <= syn_cur_addr;
+                top_state      <= TOP_LEARN_WAIT;
+            end
+
+            TOP_LEARN_WAIT: begin
+                if (syn_read_done) begin
+                    if (learn_weight_changed) begin
+                        learn_write_start <= 1'b1;
+                        learn_write_addr  <= syn_cur_addr;
+                        learn_write_data  <= learn_updated_word;
+                        top_state         <= TOP_LEARN_WRITE;
+                    end else begin
+                        top_state <= TOP_LEARN_NEXT;
+                    end
+                    syn_remaining <= syn_remaining - 5'd1;
+                    syn_cur_addr  <= syn_cur_addr + 4'd1;
+                end
+            end
+
+            TOP_LEARN_WRITE: begin
+                if (syn_write_done)
+                    top_state <= TOP_LEARN_NEXT;
+            end
+
+            TOP_LEARN_NEXT: begin
+                if (syn_remaining > 5'd0)
+                    top_state <= TOP_LEARN_READ;
+                else
+                    top_state <= TOP_DONE;
             end
 
             TOP_DONE: begin
@@ -352,8 +436,6 @@ module tt_um_openram_top (
     assign uio_out = 8'd0;
     assign uio_oe  = 8'd0;
 
-    wire _unused = &{ena, ui_in[6],
-                     syn_write_done,
-                     syn_entry_learn_en, syn_entry_raw, 1'b0};
+    wire _unused = &{ena, ui_in[6], 1'b0};
 
 endmodule
