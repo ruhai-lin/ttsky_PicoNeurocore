@@ -1,56 +1,62 @@
 # Tiny Tapeout project information
 project:
-  title:        "SRAM-backed Counter Demo"      # Project title
-  author:       "Jesse Cirimelli-Low"      # Your name
-  discord:      "insomnyaac"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "Simple 8-bit counter storing values into a single-port SRAM"      # One line description of what your project does
-  language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     50000000       # Clock frequency in Hz (or 0 if not applicable)
+  title:        "PicoNeurocore"
+  author:       "Jesse Cirimelli-Low"
+  discord:      "insomnyaac"
+  description:  "Minimal Loihi 1-style neurocore prototype with 4 LIF dendrites, synapse SRAM, and Hebbian learning"
+  language:     "Verilog"
+  clock_hz:     50000000
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
-  tiles: "2x2"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+  tiles: "3x2"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
 
   # Your top module name must start with "tt_um_". Make it unique by including your github username:
-  top_module:  "tt_um_openram_top"
+  top_module:  "tt_um_piconeurocore_top"
 
   # List your project's source files here.
   # Source files must be in ./src and you must list each source file separately, one per line.
   # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
   source_files:
   - "project.v"
+  - "dendrite.v"
+  - "axon.v"
+  - "synapse.v"
+  - "learning.v"
   - "macros/sky130_sram_1rw_tiny.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 pinout:
-  # Inputs
-  ui[0]: "write_enable"
-  ui[1]: ""
-  ui[2]: ""
-  ui[3]: ""
-  ui[4]: ""
-  ui[5]: ""
+  # Inputs  (active meaning depends on mode = ui[7])
+  #   run mode  (mode=0): dendrite test + event trigger
+  #   prog mode (mode=1): SRAM byte-programming interface
+  ui[0]: "inject_valid / addr[0]"
+  ui[1]: "step / addr[1]"
+  ui[2]: "clear / addr[2]"
+  ui[3]: "dendrite_sel[0] / addr[3]"
+  ui[4]: "dendrite_sel[1] / byte_load"
+  ui[5]: "event_in / word_write"
   ui[6]: ""
-  ui[7]: ""
+  ui[7]: "mode (0=run, 1=program)"
 
   # Outputs
-  uo[0]: "sram_dout[0]"
-  uo[1]: "sram_dout[1]"
-  uo[2]: ""
-  uo[3]: ""
-  uo[4]: ""
+  uo[0]: "spike_out[0]"
+  uo[1]: "spike_out[1]"
+  uo[2]: "spike_out[2]"
+  uo[3]: "spike_out[3]"
+  uo[4]: "top_busy"
   uo[5]: ""
-  uo[6]: ""
+  uo[6]: "syn_entry_valid"
   uo[7]: ""
 
-  # Bidirectional pins
-  uio[0]: "wmask[0]"
-  uio[1]: "wmask[1]"
-  uio[2]: "wmask[2]"
-  uio[3]: "wmask[3]"
-  uio[4]: ""
-  uio[5]: ""
-  uio[6]: ""
-  uio[7]: ""
+  # Bidirectional pins (active as inputs)
+  uio[0]: "data_byte[0]"
+  uio[1]: "data_byte[1]"
+  uio[2]: "data_byte[2]"
+  uio[3]: "data_byte[3]"
+  uio[4]: "data_byte[4]"
+  uio[5]: "data_byte[5]"
+  uio[6]: "data_byte[6]"
+  uio[7]: "data_byte[7]"
 
 # Do not change!
 yaml_version: 6

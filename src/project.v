@@ -41,7 +41,7 @@
 `default_nettype none
 `include "macros/sky130_sram_1rw_tiny.v"
 
-module tt_um_openram_top (
+module tt_um_piconeurocore_top (
     `ifdef USE_POWER_PINS
       input VPWR,
       input VGND,

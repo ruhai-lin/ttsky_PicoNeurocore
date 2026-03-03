@@ -30,7 +30,7 @@
   "//": "If you need a custom clock configuration, read the following documentation first:",
   "//": "https://tinytapeout.com/faq/#how-can-i-map-an-additional-external-clock-to-one-of-the-gpios",
   "CLOCK_PORT": "clk",
-  "DESIGN_NAME" : "tt_um_openram_top",
+  "DESIGN_NAME" : "tt_um_piconeurocore_top",
   "EXTRA_GDS" : ["src/macros/sky130_sram_1rw_tiny.gds"],
   "VERILOG_FILES_BLACKBOX" : ["src/macros/sky130_sram_1rw_tiny.v"],
   
