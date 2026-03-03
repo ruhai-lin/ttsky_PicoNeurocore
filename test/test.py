@@ -192,3 +192,80 @@ async def test_dendrite_inhibition(dut):
     await inject_weight(dut, 0, 60)
     await pulse_step(dut)
     assert get_spikes(dut) & 1, "Should fire: excitation overcomes prior inhibition"
+
+
+# ── Phase 2: Axon tests ─────────────────────────────────────────────
+
+EVENT_IN  = 1 << 5   # ui_in[5]
+RANGE_ACK = 1 << 6   # ui_in[6]
+
+def get_range_valid(dut):
+    return (dut.uo_out.value.integer >> 4) & 1
+
+@cocotb.test()
+async def test_axon_range(dut):
+    """Axon produces a valid synapse range and holds it until acknowledged."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    # Pulse event_in
+    dut.ui_in.value = EVENT_IN
+    await ClockCycles(dut.clk, 1)
+    dut.ui_in.value = 0
+    await ClockCycles(dut.clk, 1)
+
+    # range_valid should be HIGH and stay HIGH (valid/ack handshake)
+    assert get_range_valid(dut) == 1, "range_valid should be high after event"
+
+    # It should persist for another cycle
+    await ClockCycles(dut.clk, 1)
+    assert get_range_valid(dut) == 1, "range_valid should persist until ack"
+
+    # Acknowledge the range
+    dut.ui_in.value = RANGE_ACK
+    await ClockCycles(dut.clk, 1)
+    dut.ui_in.value = 0
+    await ClockCycles(dut.clk, 1)
+
+    assert get_range_valid(dut) == 0, "range_valid should drop after ack"
+
+
+@cocotb.test()
+async def test_axon_no_event(dut):
+    """Without event_in, axon stays idle."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    await ClockCycles(dut.clk, 5)
+    assert get_range_valid(dut) == 0, "range_valid should stay low without event"
+
+
+@cocotb.test()
+async def test_axon_ignores_event_while_busy(dut):
+    """A second event is ignored while a range is still outstanding."""
+    clock = Clock(dut.clk, 20, units="ns")
+    cocotb.start_soon(clock.start())
+    await reset(dut)
+
+    # First event
+    dut.ui_in.value = EVENT_IN
+    await ClockCycles(dut.clk, 1)
+    dut.ui_in.value = 0
+    await ClockCycles(dut.clk, 1)
+    assert get_range_valid(dut) == 1
+
+    # Second event while range is outstanding (should be ignored)
+    dut.ui_in.value = EVENT_IN
+    await ClockCycles(dut.clk, 1)
+    dut.ui_in.value = 0
+    await ClockCycles(dut.clk, 1)
+    assert get_range_valid(dut) == 1, "range_valid still high, second event ignored"
+
+    # Ack clears the range
+    dut.ui_in.value = RANGE_ACK
+    await ClockCycles(dut.clk, 1)
+    dut.ui_in.value = 0
+    await ClockCycles(dut.clk, 1)
+    assert get_range_valid(dut) == 0, "range_valid cleared after ack"

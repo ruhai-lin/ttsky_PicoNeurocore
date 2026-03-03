@@ -3,26 +3,29 @@
  * Top module for Tiny Tapeout / OpenRAM
  *
  * Main data flow (fully connected across development phases):
- *   input event → axon → synapse (SRAM) → dendrite → spike → learning → SRAM writeback
+ *   input event --> axon --> synapse (SRAM) --> dendrite --> spike --> learning --> SRAM writeback
  *
  * Module inventory:
- *   - 4 × dendrite  (LIF neurons)
- *   - 1 × axon      (event → synapse range selector)   — phase 2
- *   - 1 × synapse   (SRAM interface + field parsing)   — phase 3
- *   - 1 × learning  (weight update logic)               — phase 5
- *   - 1 × OpenRAM SRAM macro (16 × 32-bit, 64 bytes)
+ *   - 4 x dendrite  (LIF neurons)
+ *   - 1 x axon      (event --> synapse range selector)
+ *   - 1 x synapse   (SRAM interface + field parsing)   -- phase 3
+ *   - 1 x learning  (weight update logic)               -- phase 5
+ *   - 1 x OpenRAM SRAM macro (16 x 32-bit, 64 bytes)
  *
- * Current phase: 1 — dendrite array with direct test interface
+ * Current phase: 2 — dendrite array + axon, with direct test interface
  *
- * Pin mapping (phase 1 — direct dendrite test):
+ * Pin mapping (phase 2):
  *   ui_in[0]   : inject_valid  — pulse to inject weight into selected dendrite
  *   ui_in[1]   : step          — pulse to run LIF dynamics on all dendrites
  *   ui_in[2]   : clear         — pulse to reset accumulators for next round
- *   ui_in[4:3] : dendrite_sel  — target dendrite for weight injection (0–3)
- *   ui_in[7:5] : reserved
+ *   ui_in[4:3] : dendrite_sel  — target dendrite for weight injection (0-3)
+ *   ui_in[5]   : event_in      — pulse to trigger axon lookup
+ *   ui_in[6]   : range_ack     — pulse to acknowledge axon range (test/debug)
+ *   ui_in[7]   : reserved
  *   uio_in[7:0]: syn_weight    — signed 8-bit weight value
- *   uo_out[3:0]: spike_out     — fire status of dendrites 0–3
- *   uo_out[7:4]: reserved (0)
+ *   uo_out[3:0]: spike_out     — fire status of dendrites 0-3
+ *   uo_out[4]  : axon_range_valid — high for 1 cycle when axon has a range ready
+ *   uo_out[7:5]: reserved (0)
  */
 
 `default_nettype none
@@ -44,13 +47,33 @@ module tt_um_openram_top (
 );
 
     // ==========================================================
-    //  Pin decode — phase 1: direct test interface for dendrites
+    //  Pin decode (phase 2)
     // ==========================================================
     wire       inject_valid = ui_in[0];
     wire       step         = ui_in[1];
     wire       clear        = ui_in[2];
     wire [1:0] dendrite_sel = ui_in[4:3];
+    wire       event_in     = ui_in[5];
+    wire       range_ack    = ui_in[6];
     wire [7:0] syn_weight   = uio_in;
+
+    // ==========================================================
+    //  Axon — event-to-synapse-range mapper
+    // ==========================================================
+    wire        axon_range_valid;
+    wire [3:0]  axon_syn_start;
+    wire [4:0]  axon_syn_count;
+
+    axon u_axon (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .event_valid (event_in),
+        .event_id    (8'd0),              // single axon, fixed id
+        .range_ack   (range_ack),
+        .range_valid (axon_range_valid),
+        .syn_start   (axon_syn_start),
+        .syn_count   (axon_syn_count)
+    );
 
     // ==========================================================
     //  Dendrite array — 4 independent LIF neurons
@@ -58,7 +81,6 @@ module tt_um_openram_top (
     wire [3:0] spike_out;
     wire [15:0] membrane [0:3];
 
-    // Route inject_valid to only the selected dendrite
     wire [3:0] dend_syn_valid;
     assign dend_syn_valid[0] = inject_valid & (dendrite_sel == 2'd0);
     assign dend_syn_valid[1] = inject_valid & (dendrite_sel == 2'd1);
@@ -82,8 +104,7 @@ module tt_um_openram_top (
     endgenerate
 
     // ==========================================================
-    //  SRAM macro — present but idle in phase 1
-    //  The synapse module will drive these signals from phase 3.
+    //  SRAM macro — present but idle; synapse module drives it from phase 3
     // ==========================================================
     wire [31:0] sram_dout;
 
@@ -93,8 +114,8 @@ module tt_um_openram_top (
           .vssd1 (VGND),
         `endif
         .clk0   (clk),
-        .csb0   (1'b1),          // chip deselected
-        .web0   (1'b1),          // no write
+        .csb0   (1'b1),
+        .web0   (1'b1),
         .wmask0 (4'b0000),
         .addr0  (4'b0000),
         .din0   (32'b0),
@@ -105,12 +126,13 @@ module tt_um_openram_top (
     //  Output mapping
     // ==========================================================
     assign uo_out[3:0] = spike_out;
-    assign uo_out[7:4] = 4'd0;
+    assign uo_out[4]   = axon_range_valid;
+    assign uo_out[7:5] = 3'd0;
 
     assign uio_out = 8'd0;
     assign uio_oe  = 8'd0;
 
-    // Suppress unused-signal warnings
-    wire _unused = &{ena, ui_in[7:5], sram_dout, 1'b0};
+    wire _unused = &{ena, ui_in[7], sram_dout,
+                     axon_syn_start, axon_syn_count, 1'b0};
 
 endmodule
