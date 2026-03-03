@@ -5,7 +5,7 @@
 SIM ?= icarus
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = project.v macros/sky130_sram_1rw_tiny.v
+PROJECT_SOURCES = project.v dendrite.v macros/sky130_sram_1rw_tiny.v
 
 ifneq ($(GATES),yes)
 
