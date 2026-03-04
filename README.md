@@ -14,9 +14,13 @@ A minimal Loihi-style neurocore prototype that implements event-driven spiking n
 
 ## 📊 System Architecture Visualization
 
-![PicoNeurocore Data Flow](docs/neurocore.gif)
+<p align="center">
+  <img src="docs/neurocore.gif" alt="PicoNeurocore Data Flow" width="600">
+</p>
 
-*The animation above demonstrates how input spikes flow through the neurocore and produce outputs*
+<p align="center">
+  <em>The animation above conceptually demonstrates how input spikes flow through the neurocore and produce outputs</em>
+</p>
 
 ## 🔧 Module Architecture
 
